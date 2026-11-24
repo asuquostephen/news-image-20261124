@@ -1,60 +1,94 @@
 #!/usr/bin/env python3
-"""main.py -- entrypoint for the news-image-20261124 entry.
+"""Deliver the finished front page to the scorer's output directory.
 
-Copies the finished front page (entry.png, in this repository) to
-/output/entry.png, or to $MAKEFUN_OUTPUT_DIR/entry.png when that
-variable is set. Standard library only, no network, deterministic:
-every run writes the same bytes.
+The page itself (entry.png, drawn by frontpage24.py) sits beside this
+file. Running this program:
 
-Before copying, the image is checked against the bounty gate:
-PNG signature, IHDR 1024x1024, at most 1 MiB. After the copy, the
-written file is verified by SHA-256 digest against the source.
+1. walks the PNG chunk by chunk to confirm it is a well-formed
+   1024x1024 image under the 1 MiB cap,
+2. copies it into $MAKEFUN_OUTPUT_DIR (or /output) under a temporary
+   name and renames it into place, so a scorer never sees a
+   half-written file,
+3. re-reads the delivered copy and compares SHA-256 digests.
+
+If entry.png is missing it is first rebuilt by running
+frontpage24.py, which renders deterministically from its story data.
+Standard library only; no network.
 """
 
 import hashlib
 import os
 import struct
+import subprocess
 import sys
+from pathlib import Path
 
-SRC_NAME = "entry.png"
-MAX_BYTES = 1048576
-
-
-def fail(message):
-    print("main.py: " + message, file=sys.stderr)
-    raise SystemExit(1)
-
-
-def check_png(data):
-    if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        fail("not a PNG file (bad signature)")
-    if data[12:16] != b"IHDR":
-        fail("PNG has no IHDR chunk where expected")
-    width, height = struct.unpack(">II", data[16:24])
-    if (width, height) != (1024, 1024):
-        fail("image is %dx%d, must be 1024x1024" % (width, height))
-    if len(data) > MAX_BYTES:
-        fail("image is %d bytes, over the 1 MiB cap" % len(data))
+HERE = Path(__file__).resolve().parent
+PAGE = HERE / "entry.png"
+BUILDER = HERE / "frontpage24.py"
+SIDE = 1024
+CAP = 1_048_576
+SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, SRC_NAME)
-    with open(src, "rb") as fh:
-        data = fh.read()
-    check_png(data)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    dst = os.path.join(out_dir, SRC_NAME)
-    with open(dst, "wb") as fh:
-        fh.write(data)
-    with open(dst, "rb") as fh:
-        written = fh.read()
-    if hashlib.sha256(written).hexdigest() != hashlib.sha256(data).hexdigest():
-        fail("SHA-256 mismatch after copy")
-    print("wrote %s (%d bytes, sha256 %s)"
-          % (dst, len(written), hashlib.sha256(written).hexdigest()))
+def die(reason):
+    sys.exit(f"entry delivery failed: {reason}")
+
+
+def png_dimensions(blob):
+    """Return (width, height) by walking chunks to the IHDR payload."""
+    if not blob.startswith(SIGNATURE):
+        die("entry.png does not start with the PNG signature")
+    pos = len(SIGNATURE)
+    while pos + 8 <= len(blob):
+        (length,) = struct.unpack(">I", blob[pos : pos + 4])
+        kind = blob[pos + 4 : pos + 8]
+        if kind == b"IHDR":
+            return struct.unpack(">II", blob[pos + 8 : pos + 16])
+        pos += 12 + length  # length + type + payload + CRC
+    die("entry.png has no IHDR chunk")
+
+
+def ensure_page():
+    if PAGE.exists():
+        return PAGE.read_bytes()
+    subprocess.run([sys.executable, str(BUILDER)], check=True)
+    if not PAGE.exists():
+        die("frontpage24.py ran but entry.png is still missing")
+    return PAGE.read_bytes()
+
+
+def deliver(blob):
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / "entry.png"
+    staging = out_dir / ".entry.png.partial"
+    staging.write_bytes(blob)
+    os.replace(staging, target)
+    return target
+
+
+def inspect(blob):
+    """Validate the page against the gate; return its digest."""
+    width, height = png_dimensions(blob)
+    if (width, height) != (SIDE, SIDE):
+        die(f"page is {width}x{height}, the gate wants {SIDE}x{SIDE}")
+    if len(blob) > CAP:
+        die(f"page is {len(blob)} bytes, over the {CAP}-byte cap")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def run():
+    blob = ensure_page()
+    digest = inspect(blob)
+    if "--check" in sys.argv:
+        print(f"entry.png passes the gate - {len(blob)} bytes, sha256 {digest}")
+        return
+    target = deliver(blob)
+    if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        die("delivered copy's SHA-256 does not match the source page")
+    print(f"delivered {target} - {len(blob)} bytes, sha256 {digest}")
 
 
 if __name__ == "__main__":
-    main()
+    run()
